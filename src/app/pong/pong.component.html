@@ -1,0 +1,18 @@
+<div class="container-fluid">
+    <div class="row text-center">
+        <div class="col-md-12" *ngIf="!wristPose">
+            <p>Loading MoveNet ...</p>
+        </div>
+    </div>
+    <div class="row">
+        <div class="col-md-6">
+            <canvas id="pong-field" width="600" height="600" #canvas></canvas>
+        </div>
+        <div class="col-md-6">
+            <video autoplay playsinline muted id="webcam" width="300" height="300" #webcam></video>
+            <div *ngIf="wristPose">
+                <p>Right wrist pose: ({{ wristPose?.x?.toFixed(4) }},{{ wristPose?.y?.toFixed(4) }}), score: {{ wristPose?.score?.toFixed(4) }}</p>
+            </div>
+        </div>
+    </div>
+</div>
