@@ -1,23 +1,22 @@
 import { AfterViewInit, Component, ElementRef, ViewChild } from '@angular/core';
 
 import * as poseDetection from '@tensorflow-models/pose-detection';
-import * as tf from '@tensorflow/tfjs-core';
 import '@tensorflow/tfjs-backend-webgl';
 import { Keypoint } from '@tensorflow-models/pose-detection';
 import { of } from 'rxjs';
 import { delay, flatMap, repeat } from 'rxjs/operators';
 
-const FRAME_REFRESH_MS = 50;
+const HAND_DETECTION_MS = 35;
+const FRAME_REFRESH_MS = 20;
 const POSE_SCORE_THRESOLD = 0.275;
-const Y_MOVEMENT_THRESOLD = 0.01;
-const BALL_RADIUS_PX = 5;
-const PADDLE_Y_DELTA = 25;
+const Y_MOVEMENT_THRESOLD = 0.015;
+const BALL_RADIUS_PX = 10;
 const BALL_COLOR = 'red';
-const BALL_SPEED = 20;
+const BALL_SPEED = 50;
 const SCORES_COLOR = 'white';
 const PADDLE_COLOR = 'white';
 const PADDLE_WIDTH = 10;
-const PADDLE_HEIGHT = 150;
+const PADDLE_HEIGHT = 70;
 const PADDLE_MARGIN = 20;
 
 enum PlayerType {
@@ -50,13 +49,11 @@ export class PongComponent implements AfterViewInit {
 
   pointsPlayer = 0;
 
-  paddleYComputer!: number;
+  paddleYComputer = 0.5;
 
-  paddleYPlayer!: number;
+  ballPosition: Point = { x: 0.5, y: 0.5 };
 
-  ballPosition!: Point;
-
-  ballDirection!: Point;
+  ballDirection: Point = { x: 0.2, y: -0.98 };
 
   constructor() { }
 
@@ -81,17 +78,21 @@ export class PongComponent implements AfterViewInit {
     }
 
     video.addEventListener('loadeddata', () => {
-      const poll = of({}).pipe(
-        flatMap(this.onUpdate.bind(this)),
+      const paddleUpdate = of({}).pipe(
+        flatMap(this.updatePaddle.bind(this)),
+        delay(HAND_DETECTION_MS),
+        repeat()
+      );
+
+      const gameStateUpdate = of({}).pipe(
+        flatMap(this.updateGameState.bind(this)),
         delay(FRAME_REFRESH_MS),
         repeat()
       );
 
-      poll.subscribe();
+      paddleUpdate.subscribe();
+      gameStateUpdate.subscribe();
     });
-
-    this.paddleYComputer = this.canvasHeight / 2;
-    this.paddleYPlayer = this.canvasHeight / 2;
   }
 
   get canvasWidth(): number {
@@ -110,25 +111,22 @@ export class PongComponent implements AfterViewInit {
     return Math.floor(this.canvasHeight * y);
   }
 
-  drawPoint(x: number, y: number): void {
+  drawBall(x: number, y: number): void {
     this.context.beginPath();
-    this.context.arc(this.canvasWidth - 20, this.getCanvasPointY(y) - PADDLE_Y_DELTA, BALL_RADIUS_PX, 0, 2 * Math.PI);
+    this.context.arc(this.getCanvasPointX(x), this.getCanvasPointY(y), BALL_RADIUS_PX, 0, 2 * Math.PI);
     this.context.fillStyle = BALL_COLOR;
     this.context.fill();
   }
 
   drawPaddle(centerY: number, playerType: PlayerType): void {
     this.context.beginPath();
-    console.log(playerType, PlayerType.HUMAN)
+    this.context.fillStyle = PADDLE_COLOR;
     this.context.fillRect(
       playerType == PlayerType.HUMAN ? this.canvasWidth - PADDLE_MARGIN - PADDLE_WIDTH : PADDLE_MARGIN,
       this.getCanvasPointY(centerY) - PADDLE_HEIGHT / 2,
-      PADDLE_WIDTH / 2,
-      PADDLE_HEIGHT / 2
+      PADDLE_WIDTH,
+      PADDLE_HEIGHT
     );
-
-    this.context.fillStyle = PADDLE_COLOR;
-    this.context.fill();
   }
 
   async detectRightWristPose(): Promise<Keypoint | undefined> {
@@ -141,26 +139,102 @@ export class PongComponent implements AfterViewInit {
     return rightWristPose;
   }
 
-  async onUpdate() {
-    const newWristPose = await this.detectRightWristPose()
+  getNormalizedPosition(keypoint: Keypoint | undefined): Keypoint | undefined {
+    if (!keypoint) {
+      return;
+    }
+
+    // ignore segments of the video image
+    const minY = 0.25;
+    const maxY = 0.98;
+
+    if (keypoint.y < minY) {
+      keypoint.y = 0;
+    } else if (keypoint.y > maxY) {
+      keypoint.y = 1;
+    } else {
+      keypoint.y = (keypoint.y - minY) / (maxY - minY); // normalize y to [0, 1] range
+    }
+
+    return keypoint;
+  }
+
+  moveBall(): void {
+    this.ballPosition = {
+      x: this.ballPosition.x + this.ballDirection.x / BALL_SPEED,
+      y: this.ballPosition.y + this.ballDirection.y / BALL_SPEED
+    };
+  }
+
+  async updatePaddle() {
+    const newWristPose = this.getNormalizedPosition(await this.detectRightWristPose());
+
+    if (!this.wristPose) {
+      this.wristPose = newWristPose;
+    }
+
     let yDelta = 0;
 
     if (newWristPose && this.wristPose) {
       yDelta = Math.abs(newWristPose.y - this.wristPose.y);
     }
 
-    if (newWristPose && newWristPose.score
-      && newWristPose.score >= POSE_SCORE_THRESOLD
+    if (newWristPose && newWristPose.score && newWristPose.score >= POSE_SCORE_THRESOLD
       && yDelta >= Y_MOVEMENT_THRESOLD) {
-      this.clearCanvas();
-      this.drawHalfLine();
-      this.drawScores();
-      this.drawPaddle(newWristPose.y, PlayerType.HUMAN);
-      this.drawPaddle(0.5, PlayerType.COMPUTER);
-    }
-    
-    if (newWristPose) {
       this.wristPose = newWristPose;
+    }
+  }
+
+  async updateGameState() {
+    // collision with paddles
+    const ballX = this.getCanvasPointX(this.ballPosition.x);
+    const ballY = this.getCanvasPointY(this.ballPosition.y);
+    const leftPaddleY = this.getCanvasPointY(this.paddleYComputer);
+    const rightPaddleY = this.getCanvasPointY(this.wristPose?.y || 0.5);
+
+    if ((ballY >= leftPaddleY - PADDLE_HEIGHT / 2
+      && ballY <= leftPaddleY + PADDLE_HEIGHT / 2
+      && ballX - BALL_RADIUS_PX <= PADDLE_MARGIN + PADDLE_WIDTH)
+      || (ballY >= rightPaddleY - PADDLE_HEIGHT / 2
+        && ballY <= rightPaddleY + PADDLE_HEIGHT / 2
+        && ballX + BALL_RADIUS_PX >= this.canvasWidth - PADDLE_MARGIN - PADDLE_WIDTH)) {
+      this.ballDirection.x = -this.ballDirection.x;
+      // TODO: rotate ball direction
+    }
+
+    // collision with left-right borders
+    if (this.getCanvasPointX(this.ballPosition.x) <= BALL_RADIUS_PX) {
+      this.pointsComputer++;
+      this.ballPosition.x = 0.5;
+      this.ballPosition.y = 0.5;
+      this.ballDirection.x = 1;
+      this.ballDirection.y = 0
+    } else if (this.getCanvasPointX(this.ballPosition.x) >= this.canvasHeight - BALL_RADIUS_PX) {
+      this.pointsPlayer++;
+      this.ballPosition.x = 0.5;
+      this.ballPosition.y = 0.5;
+      this.ballDirection.x = -1;
+      this.ballDirection.y = 0
+    }
+
+    // collision with top-bottom borders
+    if (this.getCanvasPointY(this.ballPosition.y) <= BALL_RADIUS_PX
+      || this.getCanvasPointY(this.ballPosition.y) >= this.canvasHeight - BALL_RADIUS_PX) {
+      this.ballDirection.y = -this.ballDirection.y;
+    }
+
+    // TODO: move computer paddle based on some advanced strategy
+    this.paddleYComputer = this.ballPosition.y;
+
+    // refresh UI
+    this.clearCanvas();
+    this.drawHalfLine();
+    this.drawScores();
+    this.moveBall();
+    this.drawBall(this.ballPosition.x, this.ballPosition.y);
+    this.drawPaddle(this.paddleYComputer, PlayerType.COMPUTER);
+    if (this.wristPose) {
+      this.drawPaddle(this.wristPose.y, PlayerType.HUMAN);
     }
   }
 
