@@ -6,14 +6,19 @@ import { Keypoint } from '@tensorflow-models/pose-detection';
 import { of } from 'rxjs';
 import { delay, flatMap, repeat } from 'rxjs/operators';
 
-const HAND_DETECTION_MS = 35;
+const HAND_DETECTION_MS = 30;
 const FRAME_REFRESH_MS = 20;
 const POSE_SCORE_THRESOLD = 0.275;
-const Y_MOVEMENT_THRESOLD = 0.015;
+const Y_MOVEMENT_THRESOLD = 0.01;
+
 const BALL_RADIUS_PX = 10;
 const BALL_COLOR = 'red';
-const BALL_SPEED = 50;
+const BALL_SPEED = 30;
+const BALL_MIN_ROTATION = 3 / 4 * Math.PI;
+const BALL_MAX_ROTATION = 5 / 4 * Math.PI;
+
 const SCORES_COLOR = 'white';
+
 const PADDLE_COLOR = 'white';
 const PADDLE_WIDTH = 10;
 const PADDLE_HEIGHT = 70;
@@ -53,7 +58,7 @@ export class PongComponent implements AfterViewInit {
 
   ballPosition: Point = { x: 0.5, y: 0.5 };
 
-  ballDirection: Point = { x: 0.2, y: -0.98 };
+  ballDirection: Point = { x: 0.46, y: -0.89 };
 
   constructor() { }
 
@@ -62,21 +67,27 @@ export class PongComponent implements AfterViewInit {
     this.context = this.canvas.nativeElement.getContext('2d');
 
     // MoveNet detector
-    const detectorConfig = { modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING };
+    const detectorConfig = {
+      modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING,
+      enableSmoothing: true
+    };
     this.detector = await poseDetection.createDetector(poseDetection.SupportedModels.MoveNet, detectorConfig);
 
     // webcam
     const video = this.webcam.nativeElement;
 
-    if (navigator.mediaDevices.getUserMedia) {
+    if (!navigator.mediaDevices.getUserMedia) {
+      alert('You should have a working webcam to use this app.')
+    } else {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({ video: true })
         video.srcObject = stream;
       } catch (err) {
-        console.error(err);
+        alert('You should enable access to webcam to use this app.')
       }
     }
 
+    // game loop
     video.addEventListener('loadeddata', () => {
       const paddleUpdate = of({}).pipe(
         flatMap(this.updatePaddle.bind(this)),
@@ -129,13 +140,38 @@ export class PongComponent implements AfterViewInit {
     );
   }
 
+  drawScores(): void {
+    this.context.font = "96px VT323";
+    this.context.fillStyle = SCORES_COLOR;
+    this.context.textAlign = 'center';
+    this.context.fillText(this.pointsComputer.toString(), this.canvasWidth / 4, 75);
+    this.context.fillText(this.pointsPlayer.toString(), this.canvasWidth / 4 * 3, 75);
+  }
+
+  drawHalfLine(): void {
+    this.context.strokeStyle = SCORES_COLOR;
+    this.context.beginPath();
+    this.context.setLineDash([5, 15]);
+    this.context.moveTo(this.canvasWidth / 2, 0);
+    this.context.lineTo(this.canvasWidth / 2, this.canvasHeight);
+    this.context.stroke();
+  }
+
   async detectRightWristPose(): Promise<Keypoint | undefined> {
-    const poses = await this.detector.estimatePoses(this.webcam.nativeElement);
-    const keypoints = poseDetection.calculators.keypointsToNormalizedKeypoints(poses[0].keypoints, {
-      width: this.webcam.nativeElement.videoWidth,
-      height: this.webcam.nativeElement.videoHeight
+    const webcamElement = this.webcam.nativeElement;
+
+    const poses = await this.detector.estimatePoses(webcamElement, {
+      maxPoses: 1,
+      flipHorizontal: false
     });
+
+    const keypoints = poseDetection.calculators.keypointsToNormalizedKeypoints(poses[0].keypoints, {
+      width: webcamElement.videoWidth,
+      height: webcamElement.videoHeight
+    });
+
     const rightWristPose = keypoints.find(keypoint => keypoint.name === 'right_wrist');
+
     return rightWristPose;
   }
 
@@ -144,7 +180,7 @@ export class PongComponent implements AfterViewInit {
       return;
     }
 
-    // ignore segments of the video image
+    // ignore segments below y=0.25 and above y=0.98 of the video image
     const minY = 0.25;
     const maxY = 0.98;
 
@@ -153,7 +189,8 @@ export class PongComponent implements AfterViewInit {
     } else if (keypoint.y > maxY) {
       keypoint.y = 1;
     } else {
-      keypoint.y = (keypoint.y - minY) / (maxY - minY); // normalize y to [0, 1] range
+      // normalize y to [0, 1] range
+      keypoint.y = (keypoint.y - minY) / (maxY - minY); 
     }
 
     return keypoint;
@@ -164,6 +201,12 @@ export class PongComponent implements AfterViewInit {
       x: this.ballPosition.x + this.ballDirection.x / BALL_SPEED,
       y: this.ballPosition.y + this.ballDirection.y / BALL_SPEED
     };
+  }
+
+  rotateVector(point: Point, deg: number): Point {
+    point.x = Math.cos(deg) * point.x - Math.sin(deg) * point.y;
+    point.y = Math.sin(deg) * point.x + Math.cos(deg) * point.y;
+    return point;
   }
 
   async updatePaddle() {
@@ -192,14 +235,23 @@ export class PongComponent implements AfterViewInit {
     const leftPaddleY = this.getCanvasPointY(this.paddleYComputer);
     const rightPaddleY = this.getCanvasPointY(this.wristPose?.y || 0.5);
 
-    if ((ballY >= leftPaddleY - PADDLE_HEIGHT / 2
+    const collidesWithComputerPaddle = this.ballDirection.x < 0
+      && ballY >= leftPaddleY - PADDLE_HEIGHT / 2
       && ballY <= leftPaddleY + PADDLE_HEIGHT / 2
-      && ballX - BALL_RADIUS_PX <= PADDLE_MARGIN + PADDLE_WIDTH)
-      || (ballY >= rightPaddleY - PADDLE_HEIGHT / 2
-        && ballY <= rightPaddleY + PADDLE_HEIGHT / 2
-        && ballX + BALL_RADIUS_PX >= this.canvasWidth - PADDLE_MARGIN - PADDLE_WIDTH)) {
-      this.ballDirection.x = -this.ballDirection.x;
-      // TODO: rotate ball direction
+      && ballX - BALL_RADIUS_PX <= PADDLE_MARGIN + PADDLE_WIDTH;
+    const collidesWithPlayerPaddle = this.ballDirection.x > 0
+      && ballY >= rightPaddleY - PADDLE_HEIGHT / 2
+      && ballY <= rightPaddleY + PADDLE_HEIGHT / 2
+      && ballX + BALL_RADIUS_PX >= this.canvasWidth - PADDLE_MARGIN - PADDLE_WIDTH;
+
+    if (collidesWithComputerPaddle || collidesWithPlayerPaddle) {
+      const rotationRange = BALL_MAX_ROTATION - BALL_MIN_ROTATION;
+      const ballRelativePosition = (ballY - ((collidesWithComputerPaddle ? leftPaddleY : rightPaddleY) - PADDLE_HEIGHT / 2)) / PADDLE_HEIGHT;
+      const rotationDeg = BALL_MIN_ROTATION + ballRelativePosition * rotationRange
+      this.ballDirection = this.rotateVector({
+        x: Math.sign(this.ballDirection.x),
+        y: 0
+      }, collidesWithComputerPaddle ? 2 * Math.PI - rotationDeg : rotationDeg);
     }
 
     // collision with left-right borders
@@ -240,22 +292,5 @@ export class PongComponent implements AfterViewInit {
 
   clearCanvas(): void {
     this.context.clearRect(0, 0, this.canvasWidth, this.canvasHeight);
-  }
-
-  drawScores(): void {
-    this.context.font = "96px VT323";
-    this.context.fillStyle = SCORES_COLOR;
-    this.context.textAlign = 'center';
-    this.context.fillText(this.pointsComputer.toString(), this.canvasWidth / 4, 75);
-    this.context.fillText(this.pointsPlayer.toString(), this.canvasWidth / 4 * 3, 75);
-  }
-
-  drawHalfLine(): void {
-    this.context.strokeStyle = SCORES_COLOR;
-    this.context.beginPath();
-    this.context.setLineDash([5, 15]);
-    this.context.moveTo(this.canvasWidth / 2, 0);
-    this.context.lineTo(this.canvasWidth / 2, this.canvasHeight);
-    this.context.stroke();
   }
 }
